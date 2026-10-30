@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.compiler }} / ${{ matrix.build_type }}${{ matrix.sanitize == 'ON' && ' + sanitizers' || '' }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { compiler: g++,     build_type: Debug,   sanitize: ON  }
+          - { compiler: clang++, build_type: Debug,   sanitize: ON  }
+          - { compiler: g++,     build_type: Release, sanitize: OFF }
+          - { compiler: clang++, build_type: Release, sanitize: OFF }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_CXX_COMPILER=${{ matrix.compiler }}
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DWAYPOINT_SANITIZE=${{ matrix.sanitize }}
+          -DWAYPOINT_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Unit tests
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Demo and quick benchmark
+        run: |
+          ./build/waypoint_demo
+          ./build/waypoint_bench --quick
+
+  format:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: clang-format
+        run: find include src apps bench tests -name '*.?pp' | xargs clang-format --dry-run --Werror
