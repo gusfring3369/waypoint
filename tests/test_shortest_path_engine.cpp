@@ -5,6 +5,7 @@
 
 #include "test_framework.hpp"
 #include "waypoint/graph/road_network.hpp"
+#include "waypoint/graph/road_network_builder.hpp"
 #include "waypoint/routing/shortest_path_engine.hpp"
 #include "waypoint/sim/city_generator.hpp"
 

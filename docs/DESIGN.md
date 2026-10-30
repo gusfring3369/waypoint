@@ -41,11 +41,11 @@ An adjacency matrix was never an option. Road graphs average about 3.5 arcs per 
 
 ## 4. One search loop
 
-Dijkstra, A\*, one-to-many and multi-source search are the same algorithm with different seeds, heuristics and stopping rules. `ShortestPathEngine::search` is written once, as a template over the heuristic and a stop callback. Each public method is a few lines that configure it.
+Dijkstra, A\*, one-to-many and multi-source search are the same algorithm with different seeds, heuristics and stopping rules. `ShortestPathEngine::search` is written once, as a template over the heuristic and a stop condition. Each public method is a few lines that configure it. The bookkeeping lives in two small classes so the loop itself reads like the textbook version:
 
-- **Lazy deletion instead of decrease-key.** `std::priority_queue` has no decrease-key. When a node's cost improves we push it again, and the stale copy is skipped when popped (`settled == generation`). This keeps a cache-friendly binary heap and the same O((V + E) log V) bound.
-- **Generation stamps.** Labels (`cost`, `parent`, `origin`) are allocated once per engine. Instead of resetting O(V) arrays per query, each query increments a 32-bit generation, and a label counts only if its stamp matches. On wrap-around (after 2³² queries) everything is reset once.
-- **Multi-source A\*.** All candidate riders start at cost 0, each remembering its index as `origin`. Because the heuristic depends only on the node, the first label to settle the pickup comes from the rider with the fastest route. The result is exact, for about the cost of one search.
+- **`MinHeap`: lazy deletion instead of decrease-key.** `std::priority_queue` has no decrease-key. When a node's cost improves we push it again, and the stale copy is skipped when popped (`labels_.isSettled(node)`). This keeps a cache-friendly binary heap and the same O((V + E) log V) bound. `MinHeap` wraps `std::push_heap`/`pop_heap` so its memory survives between queries.
+- **`SearchLabels`: generation stamps.** Labels (`cost`, `parent`, `seed`) are allocated once per engine. Instead of resetting O(V) arrays per query, `clear()` increments a 32-bit generation, and a label counts only if its stamp matches. On wrap-around (after 2³² queries) everything is reset once.
+- **Multi-source A\*.** All candidate riders start at cost 0, each remembering its index as `seed`. Because the heuristic depends only on the node, the first label to settle the pickup comes from the rider with the fastest route. The result is exact, for about the cost of one search.
 
 **Thread-safety contract:** an engine owns mutable scratch space, so use one per thread. The `RoadNetwork` can be shared read-only.
 
@@ -74,11 +74,11 @@ Shortlist → price → assign keeps the expensive work (graph search) proportio
 
 ## 7. Matching: greedy vs Hungarian
 
-Greedy first-come-first-served is O(R·C) and simple, but an early order can take the only rider a later order could use. The Hungarian algorithm solves the assignment exactly in O(n²m).
+Matching sits behind a `Matcher` interface (Strategy pattern), so the `Dispatcher` never knows which policy it is running. `GreedyMatcher` (first-come-first-served) is O(R·C) and simple, but an early order can take the only rider a later order could use. `HungarianMatcher` solves the assignment exactly in O(n²m). Virtual dispatch is fine here because it happens once per batch. Heuristics, by contrast, are called for every road the search looks at, so they are template parameters that the compiler can inline instead.
 
 Infeasible pairs (out of radius or unreachable) are modelled as a penalty P larger than any complete set of feasible pairs (P = n · max cost + 1). Using one fewer infeasible pair always lowers the total, so the optimum serves as many orders as possible and only then minimises ETA. Infeasible pairs are dropped from the result.
 
-**Batching window trade-off:** collecting orders for a few seconds before matching improves the global result, but adds latency to every order. The benchmark's 30-order batches complete in about 4.5 ms end-to-end, so the window is limited by order arrival rate, not by compute.
+**Batching window trade-off:** collecting orders for a few seconds before matching improves the global result, but adds latency to every order. The benchmark's 30-order batches complete in about 3.5 ms end-to-end, so the window is limited by order arrival rate, not by compute.
 
 ## 8. Testing strategy
 

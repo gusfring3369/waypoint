@@ -13,80 +13,76 @@ It has no dependencies beyond a C++20 compiler and CMake. Every algorithm is che
 
 ## Highlights
 
-| | Result (from [`bench/benchmark.cpp`](bench/benchmark.cpp), 40,000-intersection city) |
+| | Result (from [`bench/`](bench), 40,000-intersection city) |
 |---|---|
-| **A\* vs Dijkstra** | **48.5% fewer nodes settled**, 41.5% faster, identical route costs over 1,000 random queries |
-| **QuadTree k-nearest** | **112x faster** than a linear scan over 50,000 riders (3.2 µs vs 361 µs per query) |
+| **A\* vs Dijkstra** | **48.5% fewer nodes settled**, ~36% faster, identical route costs over 1,000 random queries |
+| **QuadTree k-nearest** | **~100x faster** than a linear scan over 50,000 riders (~3.4 µs vs ~350 µs per query) |
 | **Multi-source A\*** | Finds the fastest of 16 candidate riders while settling **96.4% fewer nodes** than one A\* per candidate |
 | **Hungarian batch matching** | Serves **100% vs 98.8%** of orders and cuts total pickup time by **11.6%** compared with greedy dispatch |
-| **End-to-end batch** | 30 orders shortlisted, priced and optimally matched in **~4.5 ms** |
+| **End-to-end batch** | 30 orders shortlisted, priced and optimally matched in **~3.5 ms** |
 
 ---
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    subgraph Dispatch["dispatch/"]
-        D[Dispatcher] --> F[FleetIndex]
-        D --> M[Matching<br/>greedy · Hungarian]
-    end
-    subgraph Routing["routing/"]
-        E[ShortestPathEngine<br/>Dijkstra · A* · one-to-many · multi-source]
-    end
-    subgraph Spatial["spatial/"]
-        Q[QuadTree&lt;Id&gt;]
-        L[NodeLocator]
-    end
-    subgraph Graph["graph/"]
-        G[RoadNetwork<br/>CSR forward + reverse]
-        B[RoadNetworkBuilder]
-    end
-    subgraph Geo["geo/"]
-        P[Point · BoundingBox<br/>Haversine · LocalProjection]
-    end
+The code is split into five modules. Each module only uses the modules below it:
 
-    D --> E
-    F --> Q
-    L --> Q
-    L --> G
-    E --> G
-    B --> G
-    G --> P
-    Q --> P
-    S[sim/ CityGenerator] --> B
+```mermaid
+flowchart TD
+    dispatch["<b>dispatch</b><br/>Dispatcher · FleetIndex<br/>Matcher ◁ GreedyMatcher, HungarianMatcher"]
+    routing["<b>routing</b><br/>ShortestPathEngine<br/>SearchLabels · MinHeap · heuristics"]
+    spatial["<b>spatial</b><br/>QuadTree · NodeLocator"]
+    graph["<b>graph</b><br/>RoadNetworkBuilder → RoadNetwork<br/>AdjacencyIndex (CSR)"]
+    geo["<b>geo</b><br/>Point · BoundingBox · Haversine"]
+    sim["<b>sim</b><br/>generateCity"]
+
+    dispatch --> routing
+    dispatch --> spatial
+    routing --> graph
+    spatial --> graph
+    spatial --> geo
+    graph --> geo
+    sim --> graph
 ```
 
-Dependencies only point downward. `geo` knows nothing about graphs, `spatial` and `graph` know nothing about riders, and `dispatch` is the only layer with business concepts (orders, riders, assignments).
-
-| Module | Responsibility | Key types |
+| Module | What it does | Main classes |
 |---|---|---|
-| `geo` | Planar geometry in km, great-circle distance, lat/lng projection | `Point`, `BoundingBox`, `haversineKm`, `LocalProjection` |
-| `graph` | Validated, immutable-topology road graph with live traffic | `RoadNetworkBuilder`, `RoadNetwork` |
-| `routing` | All shortest-path queries, sharing one search loop | `ShortestPathEngine`, `Route` |
-| `spatial` | Proximity indexing of moving objects; snapping GPS fixes to intersections | `QuadTree<Id>`, `NodeLocator` |
-| `dispatch` | Rider pool, order-to-rider assignment | `FleetIndex`, `Dispatcher`, `CostMatrix` |
-| `sim` | Deterministic synthetic cities for tests, demo and benchmarks | `generateCity`, `CityConfig` |
+| `geo` | Points, rectangles and distances in kilometres; latitude/longitude conversion | `Point`, `BoundingBox`, `LocalProjection` |
+| `graph` | The road map: validated on input, stored compactly, traffic can be updated live | `RoadNetworkBuilder`, `RoadNetwork`, `AdjacencyIndex` |
+| `routing` | All shortest-path searches, sharing one search loop | `ShortestPathEngine`, `SearchLabels`, `MinHeap` |
+| `spatial` | "What is near this point?" for riders and intersections | `QuadTree`, `NodeLocator` |
+| `dispatch` | The business layer: riders, orders, assignment policies | `Dispatcher`, `FleetIndex`, `Matcher` |
+| `sim` | Reproducible synthetic cities for tests, the demo and benchmarks | `generateCity` |
+
+### Design patterns used
+
+| Pattern | Where | Why |
+|---|---|---|
+| **Builder** | `RoadNetworkBuilder` → `RoadNetwork` | All validation happens in one place, so a `RoadNetwork` can never be invalid |
+| **Strategy** | `Matcher` interface, implemented by `GreedyMatcher` and `HungarianMatcher` | The `Dispatcher` doesn't know which policy it runs, so new policies plug in without changing it |
+| **Dependency injection** | `Dispatcher` receives the network, fleet and matcher | Each part can be tested on its own with small, hand-built inputs |
+| **Template method / policy** | `ShortestPathEngine::search` takes a heuristic and a stop condition | Four query types share one loop, and the compiler inlines the hot path |
+| **RAII / Rule of Zero** | `QuadTree` children are `unique_ptr`, containers own everything | No manual `new`/`delete` anywhere |
 
 ### The dispatch funnel
 
-Each stage costs more per candidate than the one before, so each stage only sees what survived the previous one:
+Each stage costs more per rider than the one before, so each stage only sees the riders that survived the previous one:
 
 ```
   Order at (x, y)
         │
         ▼
- ┌──────────────────────┐   QuadTree best-first k-nearest within radius R
- │ 1. SHORTLIST         │   O(log N + k) typical · straight-line distance
+ ┌──────────────────────┐   QuadTree: nearest riders within radius R
+ │ 1. SHORTLIST         │   cheap, straight-line distance
  └──────────┬───────────┘   50,000 riders  ->  ≤ 16 candidates
             ▼
  ┌──────────────────────┐   single order : one multi-source A* (fastest rider wins)
- │ 2. PRICE             │   batch        : one reverse one-to-many Dijkstra per order
+ │ 2. PRICE             │   batch        : one reverse search per order
  └──────────┬───────────┘   exact road ETAs: one-way streets, traffic, river crossings
             ▼
  ┌──────────────────────┐   single order : take the winner
- │ 3. ASSIGN            │   batch        : Hungarian algorithm on the ETA matrix
- └──────────────────────┘   (most orders served first, then minimum total ETA)
+ │ 3. ASSIGN            │   batch        : a Matcher (greedy or Hungarian)
+ └──────────────────────┘
 ```
 
 Why not just pick the closest rider in a straight line? Rivers, one-way streets and highways make straight-line distance a poor stand-in for travel time. The demo shows this directly:
@@ -100,82 +96,71 @@ Why not just pick the closest rider in a straight line? Rivers, one-way streets 
 
 ---
 
-## Algorithms and engineering decisions
+## How the algorithms work
 
-### Road graph: CSR adjacency in both directions
-`RoadNetwork` stores edges as two **compressed sparse rows**: outgoing arcs indexed by tail for forward search, and incoming arcs indexed by head for reverse search. A node's neighbours are contiguous in memory, so relaxing a node is a linear scan. Topology is frozen at `build()`. Traffic is the only mutable state, and updating it is an O(1) write to the edge's travel time.
+### Road graph: compact adjacency lists in both directions
+`AdjacencyIndex` stores, for every intersection, the roads leaving it (or entering it), in **compressed sparse row (CSR)** form. All the lists sit back to back in one array, so a node's roads are next to each other in memory. `RoadNetwork` keeps one index for each direction. The reverse index lets one search answer "how long does each rider take to reach this pickup?".
 
-Costs are **travel times in seconds**, not distances: `length / speed × traffic`.
+Costs are **travel times in seconds** (`length / speed × traffic`), because a dispatcher cares about arrival time, not distance.
 
-### A* with a provably admissible heuristic
-The heuristic is the straight-line distance to the target divided by the network's maximum speed. The builder **enforces** the invariants that make this safe:
+### A* with a heuristic that is guaranteed safe
+The heuristic is the straight-line distance to the target divided by the network's top speed: no real route can be faster than that. `RoadNetworkBuilder` **enforces** the rules that make this true:
 
-- road length ≥ straight-line distance between its endpoints,
-- speed ≤ `maxSpeedKmh()` (by definition),
-- traffic multiplier ≥ 1 (`setTrafficMultiplier(0.5)` throws).
+- a road is never shorter than the straight line between its ends,
+- traffic can only slow a road down (`setTrafficMultiplier(0.5)` throws).
 
-Under these rules h(u) ≤ c(u, v) + h(v) for every road, so the heuristic is **consistent**: A* returns exact optimal routes and never re-expands a node. Weighted A* (`aStar(s, t, w)`) is also exposed. With w = 1.5 it settles another 45% fewer nodes, and the worst route it returned in the benchmark was 2.2% slower than optimal (the theoretical bound is 50%).
+So A* returns exactly the same routes as Dijkstra (`docs/DESIGN.md` has the proof). Weighted A* (`aStar(s, t, 1.5)`) is also available. It settles another 45% fewer nodes, and in the benchmark its worst route was 2.2% slower than optimal.
 
-### One search loop, four query types
-`ShortestPathEngine` implements Dijkstra, A\*, one-to-many and multi-source search as one templated loop. They differ only in seeds, heuristic and stopping rule:
+### One search loop, four kinds of query
+`ShortestPathEngine` runs Dijkstra, A\*, one-to-many and multi-source searches through one loop. They differ only in where they start, which heuristic they use and when they stop. Two helper classes keep the loop short:
 
-| Query | Seeds | Heuristic | Stops when |
-|---|---|---|---|
-| `dijkstra(s, t)` | {s} | 0 | t settled |
-| `aStar(s, t, w)` | {s} | w · lower bound to t | t settled |
-| `travelTimes(o, targets, dir)` | {o} | 0 | all targets settled |
-| `nearestSource(sources, t)` | all sources at cost 0 | lower bound to t | t settled → winner is its origin |
+- **`MinHeap`**: a priority queue that keeps its memory between queries. A node whose time improves is pushed again, and the outdated copy is skipped later. This replaces the "decrease-key" operation, which `std::priority_queue` doesn't have.
+- **`SearchLabels`**: per-intersection bookkeeping (best time, previous node, settled flag). Each label is stamped with a query number, so starting a new query is O(1) instead of clearing 40,000 entries.
 
-Two implementation details keep queries cheap:
-
-- **Lazy deletion instead of decrease-key.** A node whose cost improves is pushed again. Stale heap entries are skipped when popped.
-- **Generation-stamped labels.** Per-node state is allocated once per engine and tagged with a query counter, so starting a query is O(1) rather than an O(V) reset. Query cost scales with the region explored, not with the map size.
-
-### QuadTree for moving objects
-- Entries live **only in leaves**. A leaf splits after `leafCapacity` entries, and **four sibling leaves merge back** when removals bring them under capacity, so the tree reflects where riders are now rather than where they have been.
-- Child selection is O(1) arithmetic (`quadrantOf`). Points on a split line have exactly one home, so they cannot be duplicated or lost.
-- `maxDepth` stops runaway subdivision when many riders report the same coordinate (a naive QuadTree recurses until the stack overflows).
-- **Radius query** prunes quadrants that are disjoint from the circle and bulk-collects quadrants that lie entirely inside it.
-- **k-nearest** is a best-first search over quadrants ordered by distance. It stops as soon as the nearest unexplored quadrant is farther away than the current k-th best.
+### QuadTree for moving riders
+- A cell splits into four when it gets crowded, and **four quiet sibling cells merge back**, so the tree follows where riders are now.
+- `maxDepth` stops endless splitting when many riders report the same spot.
+- **Radius queries** skip cells entirely outside the circle and take cells entirely inside it without checking each point.
+- **k-nearest** visits cells closest-first and stops once no unvisited cell can beat the k-th best rider found (`NearestCollector`).
 
 ### Optimal batch assignment
-Greedy, first-come-first-served dispatch lets an early order take the only rider a later order could use. `matchOptimal` solves the rectangular assignment problem with the **Hungarian algorithm** (O(n²m)). Infeasible pairs (a rider out of range or unreachable) get a penalty larger than any complete feasible matching, so the solver **maximises orders served first**, then minimises total ETA. It is verified against exhaustive search on 300 random instances.
+`GreedyMatcher` handles orders first-come-first-served, so an early order can take the only rider a later order could use. `HungarianMatcher` solves the whole batch at once with the **Hungarian algorithm** (O(n²m)). It first serves as many orders as possible, then minimises total pickup time. Tests check it against brute force on 300 random cases.
 
 ---
 
 ## Benchmarks
 
 ```bash
-./build/waypoint_bench          # full run, about 12 s
+./build/waypoint_bench          # full run, about 10 s
 ./build/waypoint_bench --quick  # CI smoke run
 ```
 
-Measured on one core of an Intel Xeon @ 2.10 GHz, GCC 13, `-O3` (CMake Release). Synthetic city: 200 × 200 jittered grid (40,000 intersections, 141,045 directed segments, 20 × 20 km), 20% one-way streets, arterials, closures, random congestion up to 2×, and a river with bridges. Seeds are fixed. Node counts are exact; timings will vary by machine.
+Measured on one core of an Intel Xeon @ 2.10 GHz, GCC 13, `-O3` (CMake Release). Synthetic city: 200 × 200 jittered grid (40,000 intersections, 141,045 directed segments, 20 × 20 km), 20% one-way streets, arterials, closures, random congestion up to 2×, and a river with bridges. Seeds are fixed, so node counts and match quality are exact. Timings vary by about ±10% between runs and by machine.
 
 **1. Point-to-point routing** (1,000 random reachable pairs)
 
 | Algorithm | Avg nodes settled | Avg query time | Worst route vs optimal |
 |---|---:|---:|---:|
-| Dijkstra | 19,886 | 2,744 µs | 1.000× |
-| A* | 10,234 | 1,606 µs | 1.000× |
-| Weighted A* (w = 1.5) | 5,599 | 909 µs | 1.022× |
+| Dijkstra | 19,886 | 2,154 µs | 1.000× |
+| A* | 10,234 | 1,364 µs | 1.000× |
+| Weighted A* (w = 1.5) | 5,599 | 757 µs | 1.022× |
 
 **2. Rider shortlist** (50,000 riders, 10,000 queries)
 
 | Query | Linear scan | QuadTree | Speed-up |
 |---|---:|---:|---:|
-| Radius 2 km (≈1,445 hits) | 74.0 µs | 25.6 µs | 3× |
-| 16 nearest | 361.1 µs | 3.2 µs | 112× |
+| Radius 2 km (≈1,445 hits) | 100.7 µs | 21.7 µs | ~4–5× |
+| 16 nearest | 353.7 µs | 3.4 µs | ~100× |
 
-The radius query has a modest speed-up because a 2 km circle holds about 1,445 riders that must be copied either way. k-nearest, which the dispatcher actually uses, touches only a few leaves.
+The radius query gains less because a 2 km circle holds about 1,445 riders that must be copied either way. k-nearest, which the dispatcher actually uses, touches only a few cells.
 
 **3. Pricing a 16-rider shortlist** (2,000 available riders, 1,000 orders)
 
 | Strategy | Searches | Avg nodes settled | Avg time | Output |
 |---|---:|---:|---:|---|
-| A* per candidate | 16 | 1,192 | 146 µs | every ETA |
-| Reverse one-to-many Dijkstra | 1 | 940 | 135 µs | every ETA |
-| Multi-source A* | 1 | 43 | 6 µs | fastest rider only |
+| A* per candidate | 16 | 1,192 | 121 µs | every ETA |
+| Reverse one-to-many Dijkstra | 1 | 940 | 100 µs | every ETA |
+| Multi-source A* | 1 | 43 | 5 µs | fastest rider only |
 
 **4. Batch dispatch** (200 rounds of 30 orders vs 40 riders in a 3 × 3 km zone)
 
@@ -198,8 +183,8 @@ V = intersections, E = road segments, N = indexed riders, k = results.
 | One-to-many / multi-source | O((V + E) log V) worst case | one search instead of k |
 | Traffic update | O(1) | |
 | QuadTree insert / remove | O(depth) | depth ≤ `maxDepth`; ~log₄ N for spread-out data |
-| QuadTree radius query | O(depth + leaves visited + k) | worst case O(N) |
-| QuadTree k-nearest | O(k log k + leaves visited) | typically a handful of leaves |
+| QuadTree radius query | O(depth + cells visited + k) | worst case O(N) |
+| QuadTree k-nearest | O(k log k + cells visited) | typically a handful of cells |
 | Hungarian matching | O(n² m), n = min(rows, cols) | |
 | Graph memory | O(V + E) | an adjacency matrix would need V² cells: 1.6 × 10⁹ here |
 
@@ -224,54 +209,78 @@ ctest --test-dir build --output-on-failure
 | `WAYPOINT_WARNINGS_AS_ERRORS` | `OFF` | `-Werror` / `/WX` |
 | `WAYPOINT_SANITIZE` | `OFF` | AddressSanitizer + UndefinedBehaviorSanitizer |
 
-CI builds every push with GCC and Clang, in Debug with sanitizers and in Release, with `-Werror`. It also runs the tests, demo, quick benchmark and a `clang-format` check.
+The included CI workflow builds with GCC and Clang, in Debug with sanitizers and in Release, with warnings treated as errors. It also runs the tests, demo, quick benchmark and a `clang-format` check.
 
 ## Usage
 
 ```cpp
 #include "waypoint/dispatch/dispatcher.hpp"
-#include "waypoint/graph/road_network.hpp"
+#include "waypoint/dispatch/hungarian_matcher.hpp"
+#include "waypoint/graph/road_network_builder.hpp"
 #include "waypoint/spatial/node_locator.hpp"
 
 using namespace waypoint;
 
+// 1. Build the road map (coordinates in km).
 graph::RoadNetworkBuilder builder;
-const NodeId a = builder.addIntersection({0.0, 0.0});      // coordinates in km
+const NodeId a = builder.addIntersection({0.0, 0.0});
 const NodeId b = builder.addIntersection({1.0, 0.0});
 builder.addTwoWayRoad(a, b, {.speedKmh = 40.0});
 const EdgeId oneWay = builder.addRoad(b, a, {.speedKmh = 60.0, .lengthKm = 1.3});
 graph::RoadNetwork city = std::move(builder).build();
 
-routing::ShortestPathEngine engine(city);                   // one per thread
-routing::Route route = engine.aStar(a, b);                   // route.travelTime, route.path
+// 2. Route (one engine per thread).
+routing::ShortestPathEngine engine(city);
+routing::Route route = engine.aStar(a, b);                  // route.travelTime, route.path
+city.setTrafficMultiplier(oneWay, 1.8);                     // live traffic update
 
-city.setTrafficMultiplier(oneWay, 1.8);                      // live traffic update
-
-const spatial::NodeLocator locator(city);                    // GPS fix -> nearest intersection
+// 3. Track riders and dispatch orders.
+const spatial::NodeLocator locator(city);                   // GPS position -> nearest intersection
 dispatch::FleetIndex fleet(geo::BoundingBox::around({0.5, 0.0}, 10.0, 10.0));  // service area
 fleet.upsert({.id = 7, .position = {0.9, 0.1}, .node = *locator.nearestNode({0.9, 0.1})});
 
 dispatch::Dispatcher dispatcher(city, fleet, {.searchRadiusKm = 3.0});
-auto assignment = dispatcher.dispatch({.id = 1, .pickup = {0.0, 0.0}, .pickupNode = a});
+auto single = dispatcher.dispatch({.id = 1, .pickup = {0.0, 0.0}, .pickupNode = a});
+
+const dispatch::Order batch[] = {{.id = 2, .pickup = {0.0, 0.0}, .pickupNode = a}};
+auto plan = dispatcher.dispatchBatch(batch, dispatch::HungarianMatcher{});
 ```
 
-For real map data, project latitude/longitude into planar kilometres once with `geo::LocalProjection` and build the network from the projected points. Edge lengths and the heuristic then share one metric. At city scale the projection error is under 0.5% (tested).
+For real map data, convert latitude/longitude to kilometres once with `geo::LocalProjection`, then build the network from the converted points. At city scale the conversion error is under 0.5% (tested).
+
+## Code conventions
+
+- **Namespaces.** Everything lives in `waypoint::<module>` (for example `waypoint::routing::ShortestPathEngine`), so names can't clash with other libraries. Headers never contain `using namespace`. Application and test `.cpp` files may write `using namespace waypoint;` for brevity. Standard library names are always written `std::...`, without `using namespace std;`, following the Google and LLVM style guides and the C++ Core Guidelines.
+- **One class per file.** `include/waypoint/<module>/<name>.hpp` declares it, and `src/<module>/<name>.cpp` implements it. A header only contains code that must be there: small inline functions on the search hot path, or templates.
+- **Naming.** `PascalCase` types, `camelCase` functions and variables, `trailingUnderscore_` for private members, `kConstant` for constants.
+- **Errors.** Invalid input to public functions throws (`std::invalid_argument`, `std::out_of_range`). Internal assumptions are checked with `assert` in debug builds.
+- **Formatting.** `clang-format` with the repository's `.clang-format`.
 
 ## Project layout
 
 ```
-include/waypoint/   public headers, one directory per module
-src/                implementations
-tests/              unit tests (brute-force cross-checks, invariants, edge cases)
-apps/demo.cpp       guided walkthrough
-bench/benchmark.cpp reproducible benchmark behind every number in this README
-docs/DESIGN.md      design decisions, trade-offs and next steps
+include/waypoint/
+  core/      types.hpp                       ids, Seconds, constants
+  geo/       point, bounding_box, geodesy    geometry and lat/lng helpers
+  graph/     road, adjacency_index,          the road map
+             road_network, road_network_builder
+  routing/   route, heuristics, min_heap,    shortest paths
+             search_labels, shortest_path_engine
+  spatial/   quad_tree, node_locator         proximity search
+  dispatch/  models, fleet_index, cost_matrix, matcher,
+             greedy_matcher, hungarian_matcher, dispatcher
+  sim/       city_generator                  synthetic cities
+src/         one .cpp per class above (+ spatial/nearest_collector.hpp, internal)
+tests/       one test file per class, plus a tiny test harness
+apps/        demo.cpp: guided walkthrough
+bench/       one file per benchmark section + main.cpp
+docs/        DESIGN.md: design decisions and trade-offs
 ```
 
 ## Limitations and next steps
 
 - **Single-threaded queries.** Engines are cheap to construct, so a production service would keep one per worker thread over a shared, read-mostly `RoadNetwork`. Concurrent traffic updates would then need double-buffered travel-time arrays.
-- **Static topology.** Continental-scale graphs would call for preprocessing-based speed-ups such as Contraction Hierarchies or ALT landmarks. ALT would also give a much tighter heuristic than straight-line distance at maximum speed.
+- **Static topology.** Continental-scale graphs would call for preprocessing-based speed-ups such as Contraction Hierarchies or ALT landmarks. ALT would also give a much tighter heuristic than straight-line distance at top speed.
 - **Synthetic cities.** Ingesting OpenStreetMap extracts would only need a parser that feeds `RoadNetworkBuilder`.
 
-See [`docs/DESIGN.md`](docs/DESIGN.md) for the reasoning behind the main design choices.
+See [`docs/DESIGN.md`](docs/DESIGN.md) for the reasoning behind each design choice.

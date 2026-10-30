@@ -5,22 +5,18 @@
 #include <vector>
 
 #include "waypoint/core/types.hpp"
+#include "waypoint/dispatch/models.hpp"
 #include "waypoint/geo/bounding_box.hpp"
 #include "waypoint/geo/point.hpp"
 #include "waypoint/spatial/quad_tree.hpp"
 
 namespace waypoint::dispatch {
 
-struct Rider {
-    RiderId id;
-    geo::Point position;  ///< last reported GPS position
-    NodeId node;          ///< intersection the rider is snapped to for routing
-};
-
-/// The pool of riders available for new orders, indexed by position.
+/// The riders currently free to take orders, searchable by location.
 ///
-/// Location pings arrive far more often than orders, so updates are
-/// O(tree depth): remove from the old leaf, insert into the new one.
+/// Riders send location updates far more often than orders arrive, so an
+/// update is cheap: remove the rider from its old QuadTree cell and insert it
+/// into the new one.
 class FleetIndex {
 public:
     /// `serviceArea` should cover every position riders can report from, not just
@@ -42,7 +38,7 @@ public:
     [[nodiscard]] std::size_t size() const noexcept { return riders_.size(); }
 
 private:
-    spatial::QuadTree<RiderId> index_;
+    spatial::QuadTree index_;
     std::unordered_map<RiderId, Rider> riders_;
 };
 

@@ -49,11 +49,16 @@ endif()
 # ---------------------------------------------------------------------------
 add_library(waypoint
     src/geo/geodesy.cpp
+    src/graph/adjacency_index.cpp
     src/graph/road_network.cpp
+    src/graph/road_network_builder.cpp
     src/routing/shortest_path_engine.cpp
+    src/spatial/quad_tree.cpp
     src/spatial/node_locator.cpp
     src/dispatch/fleet_index.cpp
-    src/dispatch/matching.cpp
+    src/dispatch/matcher.cpp
+    src/dispatch/greedy_matcher.cpp
+    src/dispatch/hungarian_matcher.cpp
     src/dispatch/dispatcher.cpp
     src/sim/city_generator.cpp)
 add_library(waypoint::waypoint ALIAS waypoint)
@@ -70,7 +75,12 @@ if(WAYPOINT_BUILD_APPS)
     add_executable(waypoint_demo apps/demo.cpp)
     target_link_libraries(waypoint_demo PRIVATE waypoint::waypoint)
 
-    add_executable(waypoint_bench bench/benchmark.cpp)
+    add_executable(waypoint_bench
+        bench/main.cpp
+        bench/routing_benchmark.cpp
+        bench/spatial_index_benchmark.cpp
+        bench/candidate_pricing_benchmark.cpp
+        bench/batch_dispatch_benchmark.cpp)
     target_link_libraries(waypoint_bench PRIVATE waypoint::waypoint)
 endif()
 

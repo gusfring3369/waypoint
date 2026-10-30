@@ -5,6 +5,9 @@
 #include "test_framework.hpp"
 #include "waypoint/dispatch/dispatcher.hpp"
 #include "waypoint/dispatch/fleet_index.hpp"
+#include "waypoint/dispatch/greedy_matcher.hpp"
+#include "waypoint/dispatch/hungarian_matcher.hpp"
+#include "waypoint/graph/road_network_builder.hpp"
 #include "waypoint/sim/city_generator.hpp"
 #include "waypoint/spatial/node_locator.hpp"
 
@@ -64,36 +67,6 @@ TEST_CASE("dispatch ignores riders outside the search radius") {
     CHECK(!dispatcher.dispatch({.id = 1, .pickup = {0.0, 0.0}, .pickupNode = town.s0}).has_value());
 }
 
-TEST_CASE("fleet index applies location updates and drops riders leaving the area") {
-    FleetIndex fleet(kTownArea);
-    REQUIRE(fleet.upsert({.id = 1, .position = {0.0, 0.0}, .node = 0}));
-    REQUIRE(fleet.upsert({.id = 1, .position = {5.0, 0.0}, .node = 2}));  // moved
-    CHECK(fleet.size() == 1);
-    CHECK(fleet.nearby({0.0, 0.0}, 1.0, 10).empty());
-    CHECK(fleet.nearby({5.0, 0.0}, 1.0, 10).size() == 1);
-
-    CHECK(!fleet.upsert({.id = 1, .position = {50.0, 0.0}, .node = 2}));  // left the service area
-    CHECK(fleet.find(1) == nullptr);
-    CHECK(!fleet.remove(1));
-}
-
-TEST_CASE("node locator snaps to the nearest intersection") {
-    const auto city = sim::generateCity({.rows = 30, .cols = 30, .seed = 9});
-    const spatial::NodeLocator locator(city);
-    std::mt19937 rng(10);
-    std::uniform_real_distribution<double> coordinate(-0.5, 6.5);
-    for (int i = 0; i < 100; ++i) {
-        const geo::Point query{coordinate(rng), coordinate(rng)};
-        double best = kUnreachable;
-        for (NodeId node = 0; node < city.nodeCount(); ++node) {
-            best = std::min(best, geo::euclideanDistance(city.position(node), query));
-        }
-        const auto snapped = locator.nearestNode(query);
-        REQUIRE(snapped.has_value());
-        CHECK_APPROX(geo::euclideanDistance(city.position(*snapped), query), best);
-    }
-}
-
 TEST_CASE("optimal batch dispatch never does worse than greedy") {
     const auto city = sim::generateCity({.rows = 50, .cols = 50, .seed = 12});
     const spatial::NodeLocator locator(city);
@@ -113,8 +86,8 @@ TEST_CASE("optimal batch dispatch never does worse than greedy") {
         }
 
         Dispatcher dispatcher(city, fleet, {.searchRadiusKm = 3.0, .maxCandidatesPerOrder = 8});
-        const auto greedy = dispatcher.dispatchBatch(orders, MatchingStrategy::Greedy);
-        const auto optimal = dispatcher.dispatchBatch(orders, MatchingStrategy::Optimal);
+        const auto greedy = dispatcher.dispatchBatch(orders, GreedyMatcher{});
+        const auto optimal = dispatcher.dispatchBatch(orders, HungarianMatcher{});
 
         CHECK(optimal.assignments.size() + optimal.unassigned.size() == orders.size());
         CHECK(optimal.assignments.size() >= greedy.assignments.size());

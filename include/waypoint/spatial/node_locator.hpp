@@ -19,7 +19,7 @@ public:
     [[nodiscard]] std::optional<NodeId> nearestNode(geo::Point point) const;
 
 private:
-    QuadTree<NodeId> index_;
+    QuadTree index_;
 };
 
 }  // namespace waypoint::spatial

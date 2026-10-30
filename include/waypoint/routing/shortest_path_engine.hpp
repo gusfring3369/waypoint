@@ -1,101 +1,71 @@
 #pragma once
 
-#include <cstddef>
-#include <cstdint>
 #include <optional>
 #include <span>
 #include <vector>
 
 #include "waypoint/core/types.hpp"
 #include "waypoint/graph/road_network.hpp"
+#include "waypoint/routing/min_heap.hpp"
+#include "waypoint/routing/route.hpp"
+#include "waypoint/routing/search_labels.hpp"
 
 namespace waypoint::routing {
 
-struct SearchStats {
-    std::size_t nodesSettled = 0;  ///< nodes popped from the heap with a final cost
-    std::size_t edgesRelaxed = 0;  ///< arcs examined while expanding settled nodes
-};
-
-struct Route {
-    Seconds travelTime = kUnreachable;
-    std::vector<NodeId> path;  ///< source first, target last; empty when unreachable
-    SearchStats stats;
-
-    [[nodiscard]] bool found() const noexcept { return !path.empty(); }
-};
-
-struct NearestSource {
-    std::size_t sourceIndex;  ///< index into the `sources` span that won
-    Seconds travelTime;
-};
-
-/// Label-setting shortest path solver bound to one RoadNetwork.
+/// Answers shortest-path questions on one RoadNetwork.
 ///
-/// All query types share one search loop (binary heap with lazy deletion) and
-/// differ only in their seeds, heuristic and stopping rule. Per-node labels are
-/// allocated once and tagged with a query generation, so starting a query is
-/// O(1) instead of O(V): cost scales with the region explored, not the map.
+/// All four query types run the same search loop and differ only in where
+/// they start, which heuristic guides them, and when they stop:
 ///
-/// Holds mutable scratch space, so use one engine per thread.
+///   query            starts at             heuristic            stops when
+///   dijkstra         source                none                 target settled
+///   aStar            source                straight line        target settled
+///   travelTimes      origin                none                 all targets settled
+///   nearestSource    every source at once  straight line        target settled
+///
+/// The engine keeps reusable scratch memory, so give each thread its own.
 class ShortestPathEngine {
 public:
     explicit ShortestPathEngine(const graph::RoadNetwork& network);
 
-    /// Uninformed baseline: settles nodes in order of distance from `source`.
+    /// Fastest route, exploring outward evenly in every direction.
     [[nodiscard]] Route dijkstra(NodeId source, NodeId target);
 
-    /// Goal-directed search guided by RoadNetwork::lowerBoundTravelTime().
-    /// heuristicWeight == 1 is exact. A weight w > 1 (weighted A*) settles fewer
-    /// nodes but may return a route up to w times the optimum.
+    /// Fastest route, exploring toward the target first. Same result as
+    /// dijkstra() with far less work. A heuristicWeight above 1 trades
+    /// accuracy for speed (see StraightLineHeuristic).
     [[nodiscard]] Route aStar(NodeId source, NodeId target, double heuristicWeight = 1.0);
 
-    /// One-to-many: a single search from `origin` that prices every target and
-    /// stops once all are settled. Forward gives origin -> target times; Reverse
-    /// gives target -> origin times. Unreachable targets get kUnreachable.
+    /// Travel times between `origin` and each target from a single search
+    /// (kUnreachable where there is no route). Forward measures origin -> target;
+    /// Reverse measures target -> origin, e.g. riders driving to one pickup.
     [[nodiscard]] std::vector<Seconds> travelTimes(NodeId origin, std::span<const NodeId> targets,
                                                    graph::Direction direction);
 
-    /// Multi-source A*: every source starts at cost 0, and the first label to
-    /// reach `target` identifies the source with the fastest route. Prices N
-    /// sources for roughly the cost of one search.
+    /// Which source can reach `target` fastest. All sources start searching
+    /// at once and the first to arrive wins: one search instead of one per source.
     [[nodiscard]] std::optional<NearestSource> nearestSource(std::span<const NodeId> sources, NodeId target);
 
     /// Work done by the most recent query.
     [[nodiscard]] const SearchStats& lastStats() const noexcept { return stats_; }
 
 private:
-    enum class Visit { Continue, Stop };
-
-    struct Label {
-        Seconds cost = 0.0;
-        NodeId parent = kInvalidNode;
-        std::uint32_t origin = 0;   // index of the seed this label grew from
-        std::uint32_t reached = 0;  // generation in which `cost` was last written
-        std::uint32_t settled = 0;  // generation in which `cost` became final
-    };
-
-    struct HeapEntry {
-        Seconds priority;
-        NodeId node;
-    };
-
-    template <typename Heuristic, typename OnSettle>
+    template <typename Heuristic, typename StopCondition>
     void search(std::span<const NodeId> seeds, graph::Direction direction, const Heuristic& heuristic,
-                OnSettle&& onSettle);
+                StopCondition shouldStop);
 
     template <typename Heuristic>
-    [[nodiscard]] Route pointToPoint(NodeId source, NodeId target, const Heuristic& heuristic);
-    void beginQuery();
-    bool improve(NodeId node, Seconds cost, NodeId parent, std::uint32_t origin);
-    [[nodiscard]] bool isSettled(NodeId node) const noexcept;
+    void relaxArcs(NodeId node, graph::Direction direction, const Heuristic& heuristic);
+
+    template <typename Heuristic>
+    Route findRoute(NodeId source, NodeId target, const Heuristic& heuristic);
+
     [[nodiscard]] std::vector<NodeId> pathTo(NodeId target) const;
     void requireNode(NodeId node) const;
 
     const graph::RoadNetwork& network_;
-    std::vector<Label> labels_;
-    std::vector<std::uint32_t> targetMarks_;  // generation-tagged membership for travelTimes()
-    std::vector<HeapEntry> heap_;
-    std::uint32_t generation_ = 0;
+    SearchLabels labels_;
+    MinHeap frontier_;
     SearchStats stats_;
 };
 
